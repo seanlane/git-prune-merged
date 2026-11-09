@@ -115,11 +115,12 @@ branch_gone() {
 @test "skips a branch checked out in a worktree" {
   new_branch busy
   merged busy "$(git rev-parse busy)" 6
-  git worktree add -q "$BATS_TEST_TMPDIR/wt" busy
+  git worktree add -q "$BATS_TEST_TMPDIR/my wt" busy
+  wt_path=$(git worktree list --porcelain | sed -n 's/^worktree \(.*my wt\)$/\1/p')
 
   run "$SCRIPT" --live
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Skipped (in use by a worktree):"*"busy"* ]]
+  [[ "$output" == *"Skipped (in use by a worktree):"*"busy ($wt_path)"* ]]
   branch_exists busy
 }
 

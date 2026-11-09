@@ -77,10 +77,10 @@ for ((start = 0; start < ${#branches[@]}; start += CHUNK)); do
   done <<< "$result"
 done
 
-# Branches currently checked out in any worktree.
-declare -A in_use_set
+# Branches currently checked out in any worktree -> that worktree's path.
+declare -A worktree_of
 while IFS=' ' read -r br wt; do
-  [[ -n "$wt" ]] && in_use_set["$br"]=1
+  [[ -n "$wt" ]] && worktree_of["$br"]="$wt"
 done < <(git for-each-ref --format='%(refname:short) %(worktreepath)' refs/heads)
 
 # Walk local branches; classify each.
@@ -90,8 +90,8 @@ skipped_diverged=()
 
 for br in "${branches[@]}"; do
   [[ -z "${merged_sha[$br]:-}" ]] && continue           # no merged PR for this branch
-  if [[ -n "${in_use_set[$br]:-}" ]]; then
-    skipped_inuse+=("$br")
+  if [[ -n "${worktree_of[$br]:-}" ]]; then
+    skipped_inuse+=("$br (${worktree_of[$br]})")
     continue
   fi
   local_sha=$(git rev-parse --verify --quiet "refs/heads/$br" || true)
