@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+#
+# Fake gh for tests. Supports only the calls git-prune-merged makes:
+#   gh auth status
+#   gh repo view --json owner,name -q ...
+#   gh api graphql -f query=... -f owner=... -f name=... -f bN=<branch>... --jq <filter>
+#
+# Merged PRs come from $GH_MERGED_FILE, one "<branch> <head-oid> <pr-number>"
+# per line. Set GH_FAIL_GRAPHQL=1 to make the GraphQL call fail. Each GraphQL
+# call appends one line to $GH_CALL_LOG when that is set.
+
+set -euo pipefail
+
+case "${1:-} ${2:-}" in
+  "auth status")
+    exit 0
+    ;;
+  "repo view")
+    echo "test-owner test-repo"
+    exit 0
+    ;;
+  "api graphql")
+    shift 2
+    ;;
+  *)
+    echo "gh stub: unsupported call: $*" >&2
+    exit 1
+    ;;
+esac
+
+if [[ -n "${GH_CALL_LOG:-}" ]]; then
+  echo graphql >> "$GH_CALL_LOG"
+fi
+
+if [[ "${GH_FAIL_GRAPHQL:-}" == 1 ]]; then
+  echo "gh stub: simulated GraphQL failure" >&2
+  exit 1
+fi
+
+repo='{}'
+filter=''
+while (( $# > 0 )); do
+  case "$1" in
+    -f)
+      key="${2%%=*}"
+      value="${2#*=}"
+      shift 2
+      [[ "$key" =~ ^b[0-9]+$ ]] || continue
+      nodes='[]'
+      while read -r br oid number; do
+        if [[ "$br" == "$value" ]]; then
+          nodes=$(jq -n --arg oid "$oid" --argjson n "$number" '[{number: $n, headRefOid: $oid}]')
+          break
+        fi
+      done < "${GH_MERGED_FILE:?}"
+      repo=$(jq --arg k "$key" --argjson nodes "$nodes" '.[$k] = {nodes: $nodes}' <<< "$repo")
+      ;;
+    --jq)
+      filter="$2"
+      shift 2
+      ;;
+    *)
+      echo "gh stub: unexpected argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+jq -r "$filter" <<< "{\"data\": {\"repository\": $repo}}"

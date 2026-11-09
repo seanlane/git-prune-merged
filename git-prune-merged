@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+#
+# git-prune-merged — delete local branches whose PRs have been merged on the remote.
+#
+# Safety:
+#   - Skips branches checked out in any worktree.
+#   - Skips branches whose local tip is not the merged PR's head commit or an
+#     ancestor of it (i.e., you have commits the PR did not include). A local
+#     tip that is merely behind the merged head is treated as safe.
+#   - Skips branches in the protected list (master, main, staging, etc.).
+#
+# Usage:
+#   git prune-merged          # dry-run: list branches that would be deleted
+#   git prune-merged --live   # actually delete the branches
+#
+
+set -euo pipefail
+
+PROTECTED='(master|main|staging|test|dev|develop)'
+CHUNK=50
+
+LIVE=0
+for arg in "$@"; do
+  case "$arg" in
+    --live) LIVE=1 ;;
+    -h|--help)
+      sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "error: gh CLI is required" >&2
+  exit 1
+fi
+
+if ! gh auth status >/dev/null 2>&1; then
+  echo "error: gh is not authenticated; run 'gh auth login'" >&2
+  exit 1
+fi
+
+read -r repo_owner repo_name < <(gh repo view --json owner,name -q '.owner.login + " " + .name')
+
+branches=()
+while IFS= read -r br; do
+  [[ -z "$br" || "$br" =~ ^($PROTECTED)$ ]] && continue
+  branches+=("$br")
+done < <(git branch --format='%(refname:short)')
+
+# Look up the newest merged PR for every local branch, batched into one GraphQL
+# query per CHUNK branches. Branch names go in as variables, not query text.
+# A failed query aborts the script (set -e) rather than skipping branches.
+declare -A merged_sha
+declare -A merged_pr
+for ((start = 0; start < ${#branches[@]}; start += CHUNK)); do
+  decls=()
+  fields=()
+  vars=()
+  for ((i = start; i < start + CHUNK && i < ${#branches[@]}; i++)); do
+    decls+=("\$b$i: String!")
+    fields+=("b$i: pullRequests(headRefName: \$b$i, states: MERGED, first: 1, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { number headRefOid } }")
+    vars+=(-f "b$i=${branches[i]}")
+  done
+  query="query(\$owner: String!, \$name: String! ${decls[*]}) { repository(owner: \$owner, name: \$name) { ${fields[*]} } }"
+  result=$(gh api graphql -f query="$query" -f owner="$repo_owner" -f name="$repo_name" "${vars[@]}" \
+    --jq '.data.repository | to_entries[] | select(.value.nodes | length > 0) | "\(.key) \(.value.nodes[0].headRefOid) \(.value.nodes[0].number)"')
+  while read -r key oid number; do
+    [[ -z "$key" ]] && continue
+    br="${branches[${key#b}]}"
+    merged_sha["$br"]="$oid"
+    merged_pr["$br"]="$number"
+  done <<< "$result"
+done
+
+# Branches currently checked out in any worktree.
+declare -A in_use_set
+while IFS=' ' read -r br wt; do
+  [[ -n "$wt" ]] && in_use_set["$br"]=1
+done < <(git for-each-ref --format='%(refname:short) %(worktreepath)' refs/heads)
+
+# Walk local branches; classify each.
+safe=()
+skipped_inuse=()
+skipped_diverged=()
+
+for br in "${branches[@]}"; do
+  [[ -z "${merged_sha[$br]:-}" ]] && continue           # no merged PR for this branch
+  if [[ -n "${in_use_set[$br]:-}" ]]; then
+    skipped_inuse+=("$br")
+    continue
+  fi
+  local_sha=$(git rev-parse --verify --quiet "refs/heads/$br" || true)
+  [[ -z "$local_sha" ]] && continue
+  merged="${merged_sha[$br]}"
+  if [[ "$local_sha" == "$merged" ]]; then
+    safe+=("$br")
+    continue
+  fi
+  # The merged head may be missing locally (e.g. remote branch deleted after
+  # merge); fetch the PR head so the ancestry check can run.
+  if ! git cat-file -e "$merged^{commit}" 2>/dev/null; then
+    git fetch --quiet origin "pull/${merged_pr[$br]}/head" 2>/dev/null || true
+  fi
+  if git merge-base --is-ancestor "$local_sha" "$merged" 2>/dev/null; then
+    safe+=("$br")
+  else
+    skipped_diverged+=("$br (local $(git rev-parse --short "$local_sha") not contained in PR #${merged_pr[$br]} head $(git rev-parse --short "$merged"))")
+  fi
+done
+
+print_section() {
+  local label="$1"; shift
+  (( $# > 0 )) || return 0
+  echo "$label"
+  printf '  %s\n' "$@"
+}
+
+# Nothing to report?
+if (( ${#safe[@]} == 0 )) && (( ${#skipped_inuse[@]} == 0 )) && (( ${#skipped_diverged[@]} == 0 )); then
+  echo "No merged local branches to prune."
+  exit 0
+fi
+
+if [[ "$LIVE" -eq 1 ]]; then
+  if (( ${#safe[@]} > 0 )); then
+    echo "Deleting merged branches:"
+    # One branch per call: a multi-branch `git branch -D` is all-or-nothing.
+    failed=0
+    for br in "${safe[@]}"; do
+      git branch -D "$br" || failed=1
+    done
+    if (( failed )); then
+      echo "warning: some branches could not be deleted (see errors above)" >&2
+    fi
+  fi
+else
+  (( ${#safe[@]} > 0 )) && print_section "Dry-run — would delete:" "${safe[@]}"
+fi
+
+if (( ${#skipped_inuse[@]} > 0 )); then
+  echo
+  print_section "Skipped (in use by a worktree):" "${skipped_inuse[@]}"
+fi
+
+if (( ${#skipped_diverged[@]} > 0 )); then
+  echo
+  print_section "Skipped (local tip has commits not in the merged PR head — review manually):" "${skipped_diverged[@]}"
+fi
+
+if [[ "$LIVE" -ne 1 ]] && (( ${#safe[@]} > 0 )); then
+  echo
+  echo "Re-run with --live to actually delete."
+fi
