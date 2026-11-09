@@ -5,8 +5,13 @@ Delete local branches whose GitHub PRs have been merged. See the header of
 
 ## Install
 
+Clone the repo, then symlink the script into any directory on your `PATH`
+(`~/.local/bin` here). Git runs `git-prune-merged` as `git prune-merged`.
+
 ```sh
-ln -sf ~/Code/Other/git-prune-merged/git-prune-merged ~/.local/bin/git-prune-merged
+git clone git@github.com:seanlane/git-prune-merged.git
+cd git-prune-merged
+ln -sf "$PWD/git-prune-merged" ~/.local/bin/git-prune-merged
 ```
 
 Requires bash 4+, `git`, and an authenticated `gh`.
